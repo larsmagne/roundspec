@@ -6,7 +6,8 @@
  * full level it reaches the rim.  The left channel's spokes fan out over
  * the upper-left half, the right channel's over the lower-right half.
  * Bass is next to the top-right end of the diagonal, treble next to the
- * bottom-left end, mirrored on both sides.
+ * bottom-left end, mirrored on both sides.  Spoke colour glides from blue
+ * (bass) over purple to red (treble).
  *
  * Build:  cc -O2 -o roundspec roundspec.c -lasound -lX11 -lXext -lm
  *         (Debian: apt install libasound2-dev libx11-dev libxext-dev)
@@ -42,13 +43,21 @@
 #define F_HI    16000.0     /* highest frequency shown, Hz          */
 #define DB_FLOOR 70.0       /* dynamic range shown, dB below full   */
 #define DECAY   0.88        /* how slowly spikes fall back (0..1)   */
-#define COLOUR  "#b83030"
+#define COLOUR  "#b83030"   /* the circle outline                   */
+
+/* Spoke colours glide from bass to treble through these three (R,G,B). */
+static const int grad[3][3] = {
+    {  64,  96, 255 },      /* bass:   blue   */
+    { 176,  48, 208 },      /* middle: purple */
+    { 255,  48,  48 },      /* treble: red    */
+};
 
 static float ring[2][N];            /* latest N samples per channel */
 static int   ringpos;
 static float window[N];
 static float level[2][BANDS];       /* smoothed 0..1 band levels    */
 static int   band_lo[BANDS], band_hi[BANDS];
+static unsigned long band_colour[BANDS];
 static int   spoke_width = 2;       /* pixels; set with -w          */
 static double spoke_scale = 1.0;    /* length multiplier; set with -s */
 
@@ -137,7 +146,6 @@ static void draw(Display *dpy, Drawable d, GC gc, unsigned long fg,
 {
     double cx = w / 2.0, cy = h / 2.0;
     double R = (w < h ? w : h) / 2.0 - 2;
-    XSegment seg[BANDS];
     int ch, i;
 
     XSetForeground(dpy, gc, bg);
@@ -163,12 +171,9 @@ static void draw(Display *dpy, Drawable d, GC gc, unsigned long fg,
             double a = M_PI / 4 + dir * M_PI * (i + 0.5) / BANDS;
             double v = level[ch][i] * spoke_scale;
             double r = (v > 1 ? 1 : v) * R;     /* never past the rim */
-            seg[i].x1 = cx;
-            seg[i].y1 = cy;
-            seg[i].x2 = cx + r * cos(a);
-            seg[i].y2 = cy - r * sin(a);
+            XSetForeground(dpy, gc, band_colour[i]);
+            XDrawLine(dpy, d, gc, cx, cy, cx + r * cos(a), cy - r * sin(a));
         }
-        XDrawSegments(dpy, d, gc, seg, BANDS);
     }
 }
 
@@ -292,6 +297,19 @@ int main(int argc, char **argv)
     if (XParseColor(dpy, DefaultColormap(dpy, scr), COLOUR, &col) &&
         XAllocColor(dpy, DefaultColormap(dpy, scr), &col))
         fg = col.pixel;
+
+    for (int i = 0; i < BANDS; i++) {           /* bass-to-treble gradient */
+        double t = 2.0 * i / (BANDS - 1);       /* 0..2 across the bands   */
+        int k = t < 1 ? 0 : 1;
+        double f = t - k;
+        XColor c;
+        c.red   = 257 * (grad[k][0] + f * (grad[k + 1][0] - grad[k][0]));
+        c.green = 257 * (grad[k][1] + f * (grad[k + 1][1] - grad[k][1]));
+        c.blue  = 257 * (grad[k][2] + f * (grad[k + 1][2] - grad[k][2]));
+        c.flags = DoRed | DoGreen | DoBlue;
+        band_colour[i] = XAllocColor(dpy, DefaultColormap(dpy, scr), &c)
+                         ? c.pixel : fg;
+    }
 
     Window win = XCreateSimpleWindow(dpy, RootWindow(dpy, scr), 0, 0, w, h,
                                      0, bg, bg);
