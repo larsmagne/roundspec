@@ -12,7 +12,10 @@
  * Build:  cc -O2 -o roundspec roundspec.c -lasound -lX11 -lXext -lm
  *         (Debian: apt install libasound2-dev libx11-dev libxext-dev)
  *
- * Usage:  roundspec [-w width] [-s scale] [capture-device] [rate]
+ * Usage:  roundspec [-w width] [-s scale] [-c colours] [capture-device] [rate]
+ *         roundspec -c green,yellow,red plughw:Loopback,1,0
+ *                   (bass-to-treble gradient: 2 or more X colour names or
+ *                    '#rrggbb' values, separated by commas)
  *         roundspec -w 6 plughw:Loopback,1,0     (6 pixel wide spokes)
  *         roundspec -s 1.5 plughw:Loopback,1,0   (spokes 1.5 times longer)
  *         roundspec plughw:Loopback,1,0
@@ -45,12 +48,9 @@
 #define DECAY   0.88        /* how slowly spikes fall back (0..1)   */
 #define COLOUR  "#b83030"   /* the circle outline                   */
 
-/* Spoke colours glide from bass to treble through these three (R,G,B). */
-static const int grad[3][3] = {
-    {  64,  96, 255 },      /* bass:   blue   */
-    { 176,  48, 208 },      /* middle: purple */
-    { 255,  48,  48 },      /* treble: red    */
-};
+/* Spoke colours glide from bass to treble through this list; set with -c. */
+#define MAX_STOPS 8
+static const char *gradient = "#4060ff,#b030d0,#ff3030";   /* blue, purple, red */
 
 static float ring[2][N];            /* latest N samples per channel */
 static int   ringpos;
@@ -253,14 +253,16 @@ int main(int argc, char **argv)
 {
     int opt;
 
-    while ((opt = getopt(argc, argv, "w:s:")) != -1) {
+    while ((opt = getopt(argc, argv, "w:s:c:")) != -1) {
         if (opt == 'w' && atoi(optarg) > 0) {
             spoke_width = atoi(optarg);
         } else if (opt == 's' && atof(optarg) > 0) {
             spoke_scale = atof(optarg);
+        } else if (opt == 'c') {
+            gradient = optarg;
         } else {
-            fprintf(stderr,
-                    "usage: %s [-w width] [-s scale] [capture-device] [rate]\n",
+            fprintf(stderr, "usage: %s [-w width] [-s scale] [-c from,to] "
+                    "[capture-device] [rate]\n",
                     argv[0]);
             return 1;
         }
@@ -298,14 +300,31 @@ int main(int argc, char **argv)
         XAllocColor(dpy, DefaultColormap(dpy, scr), &col))
         fg = col.pixel;
 
-    for (int i = 0; i < BANDS; i++) {           /* bass-to-treble gradient */
-        double t = 2.0 * i / (BANDS - 1);       /* 0..2 across the bands   */
-        int k = t < 1 ? 0 : 1;
+    /* Parse the comma-separated gradient and give every band its colour. */
+    XColor stop[MAX_STOPS];
+    int nstops = 0;
+    char *list = strdup(gradient), *name;
+    for (name = strtok(list, ","); name; name = strtok(NULL, ",")) {
+        if (nstops == MAX_STOPS ||
+            !XParseColor(dpy, DefaultColormap(dpy, scr), name, &stop[nstops])) {
+            fprintf(stderr, "bad colour list \"%s\" (at \"%s\"); use up to %d "
+                    "names or #rrggbb values separated by commas\n",
+                    gradient, name, MAX_STOPS);
+            return 1;
+        }
+        nstops++;
+    }
+    free(list);
+    for (int i = 0; i < BANDS; i++) {
+        double t = nstops > 1 ? (double)i / (BANDS - 1) * (nstops - 1) : 0;
+        int k = (int)t;
+        if (k > nstops - 2)
+            k = nstops > 1 ? nstops - 2 : 0;
         double f = t - k;
-        XColor c;
-        c.red   = 257 * (grad[k][0] + f * (grad[k + 1][0] - grad[k][0]));
-        c.green = 257 * (grad[k][1] + f * (grad[k + 1][1] - grad[k][1]));
-        c.blue  = 257 * (grad[k][2] + f * (grad[k + 1][2] - grad[k][2]));
+        XColor *p = &stop[k], *q = &stop[nstops > 1 ? k + 1 : k], c;
+        c.red   = p->red   + f * (q->red   - p->red);
+        c.green = p->green + f * (q->green - p->green);
+        c.blue  = p->blue  + f * (q->blue  - p->blue);
         c.flags = DoRed | DoGreen | DoBlue;
         band_colour[i] = XAllocColor(dpy, DefaultColormap(dpy, scr), &c)
                          ? c.pixel : fg;
