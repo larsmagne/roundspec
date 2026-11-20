@@ -15,6 +15,10 @@
  * Usage:  roundspec [-w width] [-s scale] [-c colours] [-r secs]
  *                   [-g geometry] [-T] [capture-device] [rate]
  *         roundspec -T ...       (do not keep the window on top)
+ *         roundspec -d ...       (print what is being captured, once a second)
+ *         roundspec -n 1024 ...  (FFT size, a power of two from 256 to 16384;
+ *                                 default 2048.  Smaller reacts faster,
+ *                                 larger separates bass notes better.)
  *         roundspec -g 800 ...            (800x800 window)
  *         roundspec -g 800x800+100+50 ... (also place it at 100,50;
  *                                          -0-0 is the bottom-right corner)
@@ -49,22 +53,25 @@
 #include <time.h>
 #include <unistd.h>
 
-#define N       4096        /* FFT size (power of two)              */
-#define PERIOD  1024        /* frames read per screen update        */
+#define NMAX    16384       /* largest FFT size allowed with -n     */
+#define PERIOD  1024        /* most frames fetched in one read      */
+#define FPS     60          /* screen updates per second, at most   */
 #define BANDS   64          /* spikes per channel                   */
 #define F_LO    40.0        /* lowest frequency shown, Hz           */
 #define F_HI    16000.0     /* highest frequency shown, Hz          */
 #define DB_FLOOR 70.0       /* dynamic range shown, dB below full   */
-#define DECAY   0.88        /* how slowly spikes fall back (0..1)   */
+#define DECAY_T 0.18        /* seconds for a spoke to fall to 1/e   */
 #define COLOUR  "#b83030"   /* the circle outline                   */
 
 /* Spoke colours glide from bass to treble through this list; set with -c. */
 #define MAX_STOPS 8
 static const char *gradient = "#4060ff,#b030d0,#ff3030";   /* blue, purple, red */
 
-static float ring[2][N];            /* latest N samples per channel */
+static int   N = 2048;              /* FFT size (power of two); set with -n */
+static float ring[2][NMAX];         /* latest N samples per channel */
+static float decay = 1;             /* fall-back factor for this frame */
 static int   ringpos;
-static float window[N];
+static float window[NMAX];
 static float level[2][BANDS];       /* smoothed 0..1 band levels    */
 static int   band_lo[BANDS], band_hi[BANDS];
 static unsigned long band_colour[BANDS];
@@ -128,7 +135,7 @@ static void setup_tables(double rate)
 
 static void analyse(int ch)
 {
-    static float re[N], im[N];
+    static float re[NMAX], im[NMAX];
     int i, b;
 
     for (i = 0; i < N; i++) {
@@ -148,7 +155,7 @@ static void analyse(int ch)
         v = (v + DB_FLOOR) / DB_FLOOR;
         if (v < 0) v = 0;
         if (v > 1) v = 1;
-        level[ch][b] = v > level[ch][b] * DECAY ? v : level[ch][b] * DECAY;
+        level[ch][b] = v > level[ch][b] * decay ? v : level[ch][b] * decay;
     }
 }
 
@@ -202,9 +209,8 @@ static void draw(Display *dpy, Drawable d, GC gc, unsigned long fg,
 }
 
 /*
- * Wait up to 50 ms for audio and fetch at most PERIOD stereo frames.
- * Returns the number of frames read (0 if nothing arrived, so the window
- * stays alive during silence) or -1 at end of input.
+ * Fetch up to PERIOD stereo frames without waiting.  Returns the number
+ * of frames read, 0 if nothing has arrived yet, or -1 at end of input.
  */
 static int read_audio(snd_pcm_t *pcm, short *buf)
 {
@@ -220,20 +226,35 @@ static int read_audio(snd_pcm_t *pcm, short *buf)
         int i;
 
         /* A capture stream does not start by itself on a small read. */
-        if (snd_pcm_state(pcm) == SND_PCM_STATE_PREPARED)
-            snd_pcm_start(pcm);
+        if (snd_pcm_state(pcm) == SND_PCM_STATE_PREPARED) {
+            int err = snd_pcm_start(pcm);
+            static time_t last_msg;
+            if (err < 0 && time(NULL) != last_msg) {
+                last_msg = time(NULL);
+                fprintf(stderr, "cannot start capture: %s\n", snd_strerror(err));
+            }
+        }
 
-        n = snd_pcm_wait(pcm, 50);
+        /*
+         * Ask how much is waiting and read no more than that, so the read
+         * can never block (and never keeps the main loop from drawing).
+         */
+        n = snd_pcm_avail(pcm);
         if (n == 0)
             return 0;
         if (n > 0)
-            n = snd_pcm_readi(pcm, buf32, PERIOD);
+            n = snd_pcm_readi(pcm, buf32, n < PERIOD ? n : PERIOD);
         if (n == -EAGAIN)
             return 0;
         if (n < 0) {
             /* overrun, or the player reopened the other end: restart */
+            static time_t last_msg;
+            if (time(NULL) != last_msg) {       /* at most one line a second */
+                last_msg = time(NULL);
+                fprintf(stderr, "capture: %s; restarting\n", snd_strerror(n));
+            }
             if (snd_pcm_recover(pcm, n, 1) < 0 && snd_pcm_prepare(pcm) < 0) {
-                fprintf(stderr, "read: %s\n", snd_strerror(n));
+                fprintf(stderr, "cannot restart capture: %s\n", snd_strerror(n));
                 return -1;
             }
             return 0;
@@ -249,7 +270,7 @@ static int read_audio(snd_pcm_t *pcm, short *buf)
         size_t frames;
         ssize_t n;
 
-        if (poll(&pfd, 1, 50) <= 0)
+        if (poll(&pfd, 1, 0) <= 0)
             return 0;
         n = read(0, pend + have, sizeof pend - have);
         if (n <= 0)
@@ -283,16 +304,21 @@ int main(int argc, char **argv)
 {
     int opt;
     const char *geometry = NULL;
-    int on_top = 1, obscured = 0;
+    int on_top = 1, obscured = 0, debug = 0;
     double last_raise = 0;
 
-    while ((opt = getopt(argc, argv, "w:s:c:r:g:T")) != -1) {
+    while ((opt = getopt(argc, argv, "w:s:c:r:g:Tn:d")) != -1) {
         if (opt == 'w' && atoi(optarg) > 0) {
             spoke_width = atoi(optarg);
         } else if (opt == 's' && atof(optarg) > 0) {
             spoke_scale = atof(optarg);
         } else if (opt == 'r') {
             turn_secs = atof(optarg);
+        } else if (opt == 'n' && atoi(optarg) >= 256 && atoi(optarg) <= NMAX &&
+                   (atoi(optarg) & (atoi(optarg) - 1)) == 0) {
+            N = atoi(optarg);
+        } else if (opt == 'd') {
+            debug = 1;
         } else if (opt == 'T') {
             on_top = 0;
         } else if (opt == 'g') {
@@ -301,7 +327,7 @@ int main(int argc, char **argv)
             gradient = optarg;
         } else {
             fprintf(stderr, "usage: %s [-w width] [-s scale] [-c from,to] [-r secs] "
-                    "[-g WxH+X+Y] [-T] "
+                    "[-g WxH+X+Y] [-T] [-n fftsize] [-d] "
                     "[capture-device] [rate]\n",
                     argv[0]);
             return 1;
@@ -320,11 +346,18 @@ int main(int argc, char **argv)
         }
         if ((err = snd_pcm_set_params(pcm, SND_PCM_FORMAT_S32,
                                       SND_PCM_ACCESS_RW_INTERLEAVED,
-                                      2, rate, 1, 60000)) < 0) {
+                                      2, rate, 1, 100000)) < 0) {
             fprintf(stderr, "cannot configure %s: %s\n", dev, snd_strerror(err));
             return 1;
         }
         snd_pcm_nonblock(pcm, 1);
+    }
+    if (debug) {
+        snd_pcm_uframes_t bs = 0, ps = 0;
+        if (pcm)
+            snd_pcm_get_params(pcm, &bs, &ps);
+        fprintf(stderr, "device %s, rate %u, fft %d, buffer %lu, period %lu\n",
+                dev, rate, N, (unsigned long)bs, (unsigned long)ps);
     }
     setup_tables(rate);
 
@@ -431,22 +464,63 @@ int main(int argc, char **argv)
     int depth = DefaultDepth(dpy, scr);
     Pixmap pix = XCreatePixmap(dpy, win, w, h, depth);
 
+    double last_draw = 0, last_audio = 0, dbg_time = 0;
+    long dbg_frames = 0, dbg_reads = 0, dbg_draws = 0;
+    int dbg_peak = 0;
     while (running) {
-        int i, n = read_audio(pcm, buf);
+        /*
+         * Take everything that has arrived, so the picture always shows the
+         * newest sound and never falls behind.  The capture buffer is big
+         * (so it cannot overflow) but adds no delay, because it is emptied
+         * every couple of milliseconds.
+         */
+        int i, n, total = 0;
 
-        if (n < 0)
-            break;
-        for (i = 0; i < n; i++) {
-            ring[0][ringpos] = buf[2 * i] / 32768.0f;
-            ring[1][ringpos] = buf[2 * i + 1] / 32768.0f;
-            ringpos = (ringpos + 1) % N;
-        }
-        if (n == 0) {                    /* silence: let the spokes fall */
-            for (i = 0; i < PERIOD; i++) {
-                ring[0][ringpos] = ring[1][ringpos] = 0;
+        int reads = 0;
+
+        while ((n = read_audio(pcm, buf)) > 0) {
+            for (i = 0; i < n * 2; i++)
+                if (abs(buf[i]) > dbg_peak)
+                    dbg_peak = abs(buf[i]);
+            dbg_frames += n;
+            dbg_reads++;
+            for (i = 0; i < n; i++) {
+                ring[0][ringpos] = buf[2 * i] / 32768.0f;
+                ring[1][ringpos] = buf[2 * i + 1] / 32768.0f;
                 ringpos = (ringpos + 1) % N;
             }
+            total += n;
+            if (++reads == 64)          /* never let reading starve drawing */
+                break;
         }
+        if (n < 0)
+            break;
+
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        double tnow = ts.tv_sec + ts.tv_nsec / 1e9;
+        if (total)
+            last_audio = tnow;
+        if (debug && tnow - dbg_time >= 1) {
+            float top = 0;
+            for (i = 0; i < BANDS; i++)
+                if (level[0][i] > top)
+                    top = level[0][i];
+            fprintf(stderr, "frames %ld in %ld reads, peak sample %d of 32767, "
+                    "%ld pictures, longest left spoke %.2f, state %s\n",
+                    dbg_frames, dbg_reads, dbg_peak, dbg_draws, top,
+                    pcm ? snd_pcm_state_name(snd_pcm_state(pcm)) : "stdin");
+            dbg_frames = dbg_reads = dbg_draws = dbg_peak = 0;
+            dbg_time = tnow;
+        }
+        if (tnow - last_draw < 1.0 / FPS) {
+            usleep(2000);               /* too soon for another picture */
+            continue;
+        }
+        if (tnow - last_audio > 0.2)    /* no audio: let the spokes fall */
+            memset(ring, 0, sizeof ring);
+        decay = last_draw ? exp(-(tnow - last_draw) / DECAY_T) : 1;
+        last_draw = tnow;
 
         while (XPending(dpy)) {
             XEvent ev;
@@ -478,9 +552,7 @@ int main(int argc, char **argv)
 
         if (on_top && obscured) {
             /* At most twice a second, so two such windows cannot fight hard. */
-            struct timespec ts;
-            clock_gettime(CLOCK_MONOTONIC, &ts);
-            double t = ts.tv_sec + ts.tv_nsec / 1e9;
+            double t = tnow;
             if (t - last_raise > 0.5) {
                 XRaiseWindow(dpy, win);
                 last_raise = t;
@@ -489,9 +561,10 @@ int main(int argc, char **argv)
 
         analyse(0);
         analyse(1);
+        dbg_draws++;
         draw(dpy, pix, gc, fg, bg, w, h);
         XCopyArea(dpy, pix, win, gc, 0, 0, w, h, 0, 0);
-        XFlush(dpy);
+        XSync(dpy, False);      /* wait for the server, so frames never queue up */
     }
 
     XCloseDisplay(dpy);
