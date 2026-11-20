@@ -1,8 +1,8 @@
 /*
  * roundspec - a round, diagonal, stereo spectrum display for ALSA + X11.
  *
- * The window is a circle, divided (invisibly) by a 45 degree diagonal from
- * bottom-left to top-right.  Every frequency band is a spoke starting at the centre; at
+ * The window is a circle, divided (invisibly) by an axis that starts as a
+ * 45 degree diagonal from bottom-left to top-right and slowly turns.  Every frequency band is a spoke starting at the centre; at
  * full level it reaches the rim.  The left channel's spokes fan out over
  * the upper-left half, the right channel's over the lower-right half.
  * Bass is next to the top-right end of the diagonal, treble next to the
@@ -12,7 +12,11 @@
  * Build:  cc -O2 -o roundspec roundspec.c -lasound -lX11 -lXext -lm
  *         (Debian: apt install libasound2-dev libx11-dev libxext-dev)
  *
- * Usage:  roundspec [-w width] [-s scale] [-c colours] [capture-device] [rate]
+ * Usage:  roundspec [-w width] [-s scale] [-c colours] [-r secs]
+ *                   [capture-device] [rate]
+ *         roundspec -r 20 ...    (axis makes a full turn every 20 seconds;
+ *                                 default 60, negative turns the other way,
+ *                                 0 keeps it fixed at 45 degrees)
  *         roundspec -c green,yellow,red plughw:Loopback,1,0
  *                   (bass-to-treble gradient: 2 or more X colour names or
  *                    '#rrggbb' values, separated by commas)
@@ -37,6 +41,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #define N       4096        /* FFT size (power of two)              */
@@ -59,6 +64,7 @@ static float level[2][BANDS];       /* smoothed 0..1 band levels    */
 static int   band_lo[BANDS], band_hi[BANDS];
 static unsigned long band_colour[BANDS];
 static int   spoke_width = 2;       /* pixels; set with -w          */
+static double turn_secs = 60.0;     /* seconds per full turn; set with -r */
 static double spoke_scale = 1.0;    /* length multiplier; set with -s */
 
 /* In-place iterative radix-2 FFT. */
@@ -146,6 +152,18 @@ static void draw(Display *dpy, Drawable d, GC gc, unsigned long fg,
 {
     double cx = w / 2.0, cy = h / 2.0;
     double R = (w < h ? w : h) / 2.0 - 2;
+    double axis = M_PI / 4;             /* direction of the dividing axis */
+    struct timespec now;
+
+    if (turn_secs != 0) {               /* let the axis turn slowly */
+        static double t0;
+        double t;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        t = now.tv_sec + now.tv_nsec / 1e9;
+        if (t0 == 0)
+            t0 = t;                     /* start at 45 degrees */
+        axis += 2 * M_PI * fmod(t - t0, fabs(turn_secs)) / turn_secs;
+    }
     int ch, i;
 
     XSetForeground(dpy, gc, bg);
@@ -159,16 +177,17 @@ static void draw(Display *dpy, Drawable d, GC gc, unsigned long fg,
 
     /*
      * One spoke per band, from the centre towards the rim; a band at full
-     * level reaches the circle.  The left channel fans over the upper-left
-     * half (45 -> 225 degrees, anticlockwise), the right channel mirrors it
-     * over the lower-right half, so bass sits next to the top-right end of
-     * the diagonal and treble next to the bottom-left end on both sides.
+     * level reaches the circle.  The left channel fans anticlockwise over
+     * the half circle starting at the axis direction, the right channel
+     * mirrors it clockwise, so bass sits next to one end of the axis and
+     * treble next to the other end on both sides.  With the axis at its
+     * starting 45 degrees, left is the upper-left half and bass is top-right.
      */
     XSetLineAttributes(dpy, gc, spoke_width, LineSolid, CapRound, JoinRound);
     for (ch = 0; ch < 2; ch++) {
         double dir = ch == 0 ? 1.0 : -1.0;
         for (i = 0; i < BANDS; i++) {
-            double a = M_PI / 4 + dir * M_PI * (i + 0.5) / BANDS;
+            double a = axis + dir * M_PI * (i + 0.5) / BANDS;
             double v = level[ch][i] * spoke_scale;
             double r = (v > 1 ? 1 : v) * R;     /* never past the rim */
             XSetForeground(dpy, gc, band_colour[i]);
@@ -218,18 +237,24 @@ static int read_audio(snd_pcm_t *pcm, short *buf)
             buf[i] = buf32[i] >> 16;
         return n;
     } else {
+        /* Take whatever has arrived; keep a partial frame for next time. */
+        static char pend[PERIOD * 2 * sizeof(short)];
+        static size_t have;
         struct pollfd pfd = { 0, POLLIN, 0 };
-        size_t want = PERIOD * 2 * sizeof(short), got = 0;
+        size_t frames;
+        ssize_t n;
 
         if (poll(&pfd, 1, 50) <= 0)
             return 0;
-        while (got < want) {
-            ssize_t n = read(0, (char *)buf + got, want - got);
-            if (n <= 0)
-                return -1;
-            got += n;
-        }
-        return PERIOD;
+        n = read(0, pend + have, sizeof pend - have);
+        if (n <= 0)
+            return -1;
+        have += n;
+        frames = have / (2 * sizeof(short));
+        memcpy(buf, pend, frames * 2 * sizeof(short));
+        have -= frames * 2 * sizeof(short);
+        memmove(pend, pend + frames * 2 * sizeof(short), have);
+        return frames;
     }
 }
 
@@ -253,15 +278,17 @@ int main(int argc, char **argv)
 {
     int opt;
 
-    while ((opt = getopt(argc, argv, "w:s:c:")) != -1) {
+    while ((opt = getopt(argc, argv, "w:s:c:r:")) != -1) {
         if (opt == 'w' && atoi(optarg) > 0) {
             spoke_width = atoi(optarg);
         } else if (opt == 's' && atof(optarg) > 0) {
             spoke_scale = atof(optarg);
+        } else if (opt == 'r') {
+            turn_secs = atof(optarg);
         } else if (opt == 'c') {
             gradient = optarg;
         } else {
-            fprintf(stderr, "usage: %s [-w width] [-s scale] [-c from,to] "
+            fprintf(stderr, "usage: %s [-w width] [-s scale] [-c from,to] [-r secs] "
                     "[capture-device] [rate]\n",
                     argv[0]);
             return 1;
