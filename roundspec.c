@@ -13,7 +13,10 @@
  *         (Debian: apt install libasound2-dev libx11-dev libxext-dev)
  *
  * Usage:  roundspec [-w width] [-s scale] [-c colours] [-r secs]
- *                   [capture-device] [rate]
+ *                   [-g geometry] [capture-device] [rate]
+ *         roundspec -g 800 ...            (800x800 window)
+ *         roundspec -g 800x800+100+50 ... (also place it at 100,50;
+ *                                          -0-0 is the bottom-right corner)
  *         roundspec -r 20 ...    (axis makes a full turn every 20 seconds;
  *                                 default 60, negative turns the other way,
  *                                 0 keeps it fixed at 45 degrees)
@@ -277,18 +280,22 @@ static void set_round_shape(Display *dpy, Window win, int w, int h)
 int main(int argc, char **argv)
 {
     int opt;
+    const char *geometry = NULL;
 
-    while ((opt = getopt(argc, argv, "w:s:c:r:")) != -1) {
+    while ((opt = getopt(argc, argv, "w:s:c:r:g:")) != -1) {
         if (opt == 'w' && atoi(optarg) > 0) {
             spoke_width = atoi(optarg);
         } else if (opt == 's' && atof(optarg) > 0) {
             spoke_scale = atof(optarg);
         } else if (opt == 'r') {
             turn_secs = atof(optarg);
+        } else if (opt == 'g') {
+            geometry = optarg;
         } else if (opt == 'c') {
             gradient = optarg;
         } else {
             fprintf(stderr, "usage: %s [-w width] [-s scale] [-c from,to] [-r secs] "
+                    "[-g WxH+X+Y] "
                     "[capture-device] [rate]\n",
                     argv[0]);
             return 1;
@@ -357,9 +364,33 @@ int main(int argc, char **argv)
                          ? c.pixel : fg;
     }
 
-    Window win = XCreateSimpleWindow(dpy, RootWindow(dpy, scr), 0, 0, w, h,
+    int wx = 0, wy = 0, placed = 0;
+    if (geometry) {
+        unsigned gw, gh;
+        int f = XParseGeometry(geometry, &wx, &wy, &gw, &gh);
+        if (f & WidthValue)
+            w = h = gw;                 /* "-g 800" means 800x800 */
+        if (f & HeightValue)
+            h = gh;
+        if (f & XNegative)
+            wx += DisplayWidth(dpy, scr) - w;
+        if (f & YNegative)
+            wy += DisplayHeight(dpy, scr) - h;
+        placed = f & (XValue | YValue);
+        if (!(f & (WidthValue | XValue | YValue)) || w < 20 || h < 20) {
+            fprintf(stderr, "bad geometry \"%s\"; use e.g. 800, 800x600 or "
+                    "800x800+100+50\n", geometry);
+            return 1;
+        }
+    }
+
+    Window win = XCreateSimpleWindow(dpy, RootWindow(dpy, scr), wx, wy, w, h,
                                      0, bg, bg);
     XStoreName(dpy, win, "roundspec");
+    XSizeHints sh;                      /* tell the window manager we mean it */
+    sh.flags = USSize | (placed ? USPosition : 0);
+    sh.x = wx; sh.y = wy; sh.width = w; sh.height = h;
+    XSetWMNormalHints(dpy, win, &sh);
     XSelectInput(dpy, win, StructureNotifyMask | KeyPressMask |
                  ButtonPressMask | Button1MotionMask);
 
