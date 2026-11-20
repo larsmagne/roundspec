@@ -13,7 +13,8 @@
  *         (Debian: apt install libasound2-dev libx11-dev libxext-dev)
  *
  * Usage:  roundspec [-w width] [-s scale] [-c colours] [-r secs]
- *                   [-g geometry] [capture-device] [rate]
+ *                   [-g geometry] [-T] [capture-device] [rate]
+ *         roundspec -T ...       (do not keep the window on top)
  *         roundspec -g 800 ...            (800x800 window)
  *         roundspec -g 800x800+100+50 ... (also place it at 100,50;
  *                                          -0-0 is the bottom-right corner)
@@ -28,7 +29,8 @@
  *         roundspec plughw:Loopback,1,0
  *         roundspec -            (raw S16 stereo on stdin, e.g. an mpd fifo)
  *
- * The window is round and has no title bar: drag it with the left mouse
+ * The window is round, has no title bar (if the window manager agrees) and
+ * keeps itself on top of other windows: drag it with the left mouse
  * button to move it; q or Escape quits.
  */
 
@@ -281,21 +283,25 @@ int main(int argc, char **argv)
 {
     int opt;
     const char *geometry = NULL;
+    int on_top = 1, obscured = 0;
+    double last_raise = 0;
 
-    while ((opt = getopt(argc, argv, "w:s:c:r:g:")) != -1) {
+    while ((opt = getopt(argc, argv, "w:s:c:r:g:T")) != -1) {
         if (opt == 'w' && atoi(optarg) > 0) {
             spoke_width = atoi(optarg);
         } else if (opt == 's' && atof(optarg) > 0) {
             spoke_scale = atof(optarg);
         } else if (opt == 'r') {
             turn_secs = atof(optarg);
+        } else if (opt == 'T') {
+            on_top = 0;
         } else if (opt == 'g') {
             geometry = optarg;
         } else if (opt == 'c') {
             gradient = optarg;
         } else {
             fprintf(stderr, "usage: %s [-w width] [-s scale] [-c from,to] [-r secs] "
-                    "[-g WxH+X+Y] "
+                    "[-g WxH+X+Y] [-T] "
                     "[capture-device] [rate]\n",
                     argv[0]);
             return 1;
@@ -392,7 +398,20 @@ int main(int argc, char **argv)
     sh.x = wx; sh.y = wy; sh.width = w; sh.height = h;
     XSetWMNormalHints(dpy, win, &sh);
     XSelectInput(dpy, win, StructureNotifyMask | KeyPressMask |
-                 ButtonPressMask | Button1MotionMask);
+                 ButtonPressMask | Button1MotionMask | VisibilityChangeMask);
+
+    /*
+     * Staying on top.  Modern window managers do it for us when asked with
+     * _NET_WM_STATE_ABOVE.  Old ones such as twm know nothing about that,
+     * so we also watch for being covered (VisibilityNotify) and raise
+     * ourselves in the main loop.
+     */
+    if (on_top) {
+        Atom state = XInternAtom(dpy, "_NET_WM_STATE", False);
+        Atom above = XInternAtom(dpy, "_NET_WM_STATE_ABOVE", False);
+        XChangeProperty(dpy, win, state, XA_ATOM, 32, PropModeReplace,
+                        (unsigned char *)&above, 1);
+    }
 
     /* Ask the window manager for no title bar or border. */
     Atom motif = XInternAtom(dpy, "_MOTIF_WM_HINTS", False);
@@ -439,6 +458,8 @@ int main(int argc, char **argv)
                 XFreePixmap(dpy, pix);
                 pix = XCreatePixmap(dpy, win, w, h, depth);
                 set_round_shape(dpy, win, w, h);
+            } else if (ev.type == VisibilityNotify) {
+                obscured = ev.xvisibility.state != VisibilityUnobscured;
             } else if (ev.type == ButtonPress && ev.xbutton.button == Button1) {
                 drag_x = ev.xbutton.x;
                 drag_y = ev.xbutton.y;
@@ -452,6 +473,17 @@ int main(int argc, char **argv)
             } else if (ev.type == ClientMessage &&
                        (Atom)ev.xclient.data.l[0] == wm_delete) {
                 running = 0;
+            }
+        }
+
+        if (on_top && obscured) {
+            /* At most twice a second, so two such windows cannot fight hard. */
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            double t = ts.tv_sec + ts.tv_nsec / 1e9;
+            if (t - last_raise > 0.5) {
+                XRaiseWindow(dpy, win);
+                last_raise = t;
             }
         }
 
