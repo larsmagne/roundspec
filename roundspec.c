@@ -16,6 +16,10 @@
  *                   [-g geometry] [-T] [capture-device] [rate]
  *         roundspec -T ...       (do not keep the window on top)
  *         roundspec -d ...       (print what is being captured, once a second)
+ *         roundspec -u ...       (unmirrored: both channels run the same way
+ *                                 round the circle, so the right channel's
+ *                                 bass follows the left channel's treble)
+ *         roundspec -f ...       (flip: swap the bass and treble ends)
  *         roundspec -n 1024 ...  (FFT size, a power of two from 256 to 16384;
  *                                 default 2048.  Smaller reacts faster,
  *                                 larger separates bass notes better.)
@@ -76,6 +80,8 @@ static float level[2][BANDS];       /* smoothed 0..1 band levels    */
 static int   band_lo[BANDS], band_hi[BANDS];
 static unsigned long band_colour[BANDS];
 static int   spoke_width = 2;       /* pixels; set with -w          */
+static int   unmirrored = 0;        /* set with -u                  */
+static int   flipped = 0;           /* set with -f                  */
 static double turn_secs = 60.0;     /* seconds per full turn; set with -r */
 static double spoke_scale = 1.0;    /* length multiplier; set with -s */
 
@@ -199,7 +205,14 @@ static void draw(Display *dpy, Drawable d, GC gc, unsigned long fg,
     for (ch = 0; ch < 2; ch++) {
         double dir = ch == 0 ? 1.0 : -1.0;
         for (i = 0; i < BANDS; i++) {
-            double a = axis + dir * M_PI * (i + 0.5) / BANDS;
+            double frac = (i + 0.5) / BANDS;    /* 0 = bass, 1 = treble */
+            double a;
+            if (flipped)
+                frac = 1 - frac;
+            if (unmirrored)     /* right half carries on anticlockwise */
+                a = axis + (ch == 0 ? 0 : M_PI) + M_PI * frac;
+            else                /* right half is a mirror image of the left */
+                a = axis + dir * M_PI * frac;
             double v = level[ch][i] * spoke_scale;
             double r = (v > 1 ? 1 : v) * R;     /* never past the rim */
             XSetForeground(dpy, gc, band_colour[i]);
@@ -307,7 +320,7 @@ int main(int argc, char **argv)
     int on_top = 1, obscured = 0, debug = 0;
     double last_raise = 0;
 
-    while ((opt = getopt(argc, argv, "w:s:c:r:g:Tn:d")) != -1) {
+    while ((opt = getopt(argc, argv, "w:s:c:r:g:Tn:duf")) != -1) {
         if (opt == 'w' && atoi(optarg) > 0) {
             spoke_width = atoi(optarg);
         } else if (opt == 's' && atof(optarg) > 0) {
@@ -317,6 +330,10 @@ int main(int argc, char **argv)
         } else if (opt == 'n' && atoi(optarg) >= 256 && atoi(optarg) <= NMAX &&
                    (atoi(optarg) & (atoi(optarg) - 1)) == 0) {
             N = atoi(optarg);
+        } else if (opt == 'u') {
+            unmirrored = 1;
+        } else if (opt == 'f') {
+            flipped = 1;
         } else if (opt == 'd') {
             debug = 1;
         } else if (opt == 'T') {
@@ -327,7 +344,7 @@ int main(int argc, char **argv)
             gradient = optarg;
         } else {
             fprintf(stderr, "usage: %s [-w width] [-s scale] [-c from,to] [-r secs] "
-                    "[-g WxH+X+Y] [-T] [-n fftsize] [-d] "
+                    "[-g WxH+X+Y] [-T] [-n fftsize] [-u] [-f] [-d] "
                     "[capture-device] [rate]\n",
                     argv[0]);
             return 1;
