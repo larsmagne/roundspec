@@ -20,6 +20,8 @@
  *                                 round the circle, so the right channel's
  *                                 bass follows the left channel's treble)
  *         roundspec -f ...       (flip: swap the bass and treble ends)
+ *         roundspec -b 120 ...   (bounce the window around the screen at
+ *                                 120 pixels per second, turning at the edges)
  *         roundspec -n 1024 ...  (FFT size, a power of two from 256 to 16384;
  *                                 default 2048.  Smaller reacts faster,
  *                                 larger separates bass notes better.)
@@ -82,6 +84,7 @@ static unsigned long band_colour[BANDS];
 static int   spoke_width = 2;       /* pixels; set with -w          */
 static int   unmirrored = 0;        /* set with -u                  */
 static int   flipped = 0;           /* set with -f                  */
+static double bounce = 0;           /* pixels per second; set with -b */
 static double turn_secs = 60.0;     /* seconds per full turn; set with -r */
 static double spoke_scale = 1.0;    /* length multiplier; set with -s */
 
@@ -320,7 +323,7 @@ int main(int argc, char **argv)
     int on_top = 1, obscured = 0, debug = 0;
     double last_raise = 0;
 
-    while ((opt = getopt(argc, argv, "w:s:c:r:g:Tn:duf")) != -1) {
+    while ((opt = getopt(argc, argv, "w:s:c:r:g:Tn:dufb:")) != -1) {
         if (opt == 'w' && atoi(optarg) > 0) {
             spoke_width = atoi(optarg);
         } else if (opt == 's' && atof(optarg) > 0) {
@@ -330,6 +333,8 @@ int main(int argc, char **argv)
         } else if (opt == 'n' && atoi(optarg) >= 256 && atoi(optarg) <= NMAX &&
                    (atoi(optarg) & (atoi(optarg) - 1)) == 0) {
             N = atoi(optarg);
+        } else if (opt == 'b' && atof(optarg) > 0) {
+            bounce = atof(optarg);
         } else if (opt == 'u') {
             unmirrored = 1;
         } else if (opt == 'f') {
@@ -344,7 +349,7 @@ int main(int argc, char **argv)
             gradient = optarg;
         } else {
             fprintf(stderr, "usage: %s [-w width] [-s scale] [-c from,to] [-r secs] "
-                    "[-g WxH+X+Y] [-T] [-n fftsize] [-u] [-f] [-d] "
+                    "[-g WxH+X+Y] [-T] [-n fftsize] [-u] [-f] [-b speed] [-d] "
                     "[capture-device] [rate]\n",
                     argv[0]);
             return 1;
@@ -470,6 +475,12 @@ int main(int argc, char **argv)
                     (unsigned char *)hints, 5);
     set_round_shape(dpy, win, w, h);
     int drag_x = 0, drag_y = 0;                 /* pointer offset while dragging */
+
+    /* Bouncing: window position (top-left, screen coordinates) and velocity. */
+    double pos_x = 0, pos_y = 0;
+    double vel_x = bounce * cos(40 * M_PI / 180);
+    double vel_y = bounce * sin(40 * M_PI / 180);
+    int have_pos = 0;
     Atom wm_delete = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
     XSetWMProtocols(dpy, win, &wm_delete, 1);
     XMapWindow(dpy, win);
@@ -537,6 +548,33 @@ int main(int argc, char **argv)
         if (tnow - last_audio > 0.2)    /* no audio: let the spokes fall */
             memset(ring, 0, sizeof ring);
         decay = last_draw ? exp(-(tnow - last_draw) / DECAY_T) : 1;
+
+        if (bounce > 0 && last_draw) {
+            /* The disc (not the window rectangle) turns at the screen edges. */
+            double dt = tnow - last_draw;
+            int d = w < h ? w : h, ox = (w - d) / 2, oy = (h - d) / 2;
+            double max_x = DisplayWidth(dpy, scr) - d - ox;
+            double max_y = DisplayHeight(dpy, scr) - d - oy;
+
+            if (!have_pos) {            /* start from where we are now */
+                Window child;
+                int rx, ry;
+                XTranslateCoordinates(dpy, win, RootWindow(dpy, scr), 0, 0,
+                                      &rx, &ry, &child);
+                pos_x = rx;
+                pos_y = ry;
+                have_pos = 1;
+            }
+            if (dt > 0.1)
+                dt = 0.1;               /* no big jump after a stall */
+            pos_x += vel_x * dt;
+            pos_y += vel_y * dt;
+            if (pos_x < -ox)   { pos_x = -ox;   vel_x = fabs(vel_x); }
+            if (pos_x > max_x) { pos_x = max_x; vel_x = -fabs(vel_x); }
+            if (pos_y < -oy)   { pos_y = -oy;   vel_y = fabs(vel_y); }
+            if (pos_y > max_y) { pos_y = max_y; vel_y = -fabs(vel_y); }
+            XMoveWindow(dpy, win, (int)floor(pos_x + 0.5), (int)floor(pos_y + 0.5));
+        }
         last_draw = tnow;
 
         while (XPending(dpy)) {
@@ -557,6 +595,9 @@ int main(int argc, char **argv)
             } else if (ev.type == MotionNotify) {
                 XMoveWindow(dpy, win, ev.xmotion.x_root - drag_x,
                             ev.xmotion.y_root - drag_y);
+                pos_x = ev.xmotion.x_root - drag_x;     /* bounce on from here */
+                pos_y = ev.xmotion.y_root - drag_y;
+                have_pos = 1;
             } else if (ev.type == KeyPress) {
                 KeySym k = XLookupKeysym(&ev.xkey, 0);
                 if (k == XK_q || k == XK_Escape)
