@@ -20,6 +20,8 @@
  *                                 round the circle, so the right channel's
  *                                 bass follows the left channel's treble)
  *         roundspec -f ...       (flip: swap the bass and treble ends)
+ *         roundspec -k 30 ...    (hide for 30 seconds after any key is
+ *                                 pressed anywhere; default 10, 0 = never)
  *         roundspec -b 120 ...   (bounce the window around the screen at
  *                                 120 pixels per second, turning at the edges)
  *         roundspec -n 1024 ...  (FFT size, a power of two from 256 to 16384;
@@ -85,6 +87,7 @@ static int   spoke_width = 2;       /* pixels; set with -w          */
 static int   unmirrored = 0;        /* set with -u                  */
 static int   flipped = 0;           /* set with -f                  */
 static double bounce = 0;           /* pixels per second; set with -b */
+static double hide_secs = 10;       /* hide this long after a key press; -k */
 static double turn_secs = 60.0;     /* seconds per full turn; set with -r */
 static double spoke_scale = 1.0;    /* length multiplier; set with -s */
 
@@ -323,7 +326,7 @@ int main(int argc, char **argv)
     int on_top = 1, obscured = 0, debug = 0;
     double last_raise = 0;
 
-    while ((opt = getopt(argc, argv, "w:s:c:r:g:Tn:dufb:")) != -1) {
+    while ((opt = getopt(argc, argv, "w:s:c:r:g:Tn:dufb:k:")) != -1) {
         if (opt == 'w' && atoi(optarg) > 0) {
             spoke_width = atoi(optarg);
         } else if (opt == 's' && atof(optarg) > 0) {
@@ -333,6 +336,8 @@ int main(int argc, char **argv)
         } else if (opt == 'n' && atoi(optarg) >= 256 && atoi(optarg) <= NMAX &&
                    (atoi(optarg) & (atoi(optarg) - 1)) == 0) {
             N = atoi(optarg);
+        } else if (opt == 'k') {
+            hide_secs = atof(optarg);
         } else if (opt == 'b' && atof(optarg) > 0) {
             bounce = atof(optarg);
         } else if (opt == 'u') {
@@ -349,7 +354,8 @@ int main(int argc, char **argv)
             gradient = optarg;
         } else {
             fprintf(stderr, "usage: %s [-w width] [-s scale] [-c from,to] [-r secs] "
-                    "[-g WxH+X+Y] [-T] [-n fftsize] [-u] [-f] [-b speed] [-d] "
+                    "[-g WxH+X+Y] [-T] [-n fftsize] [-u] [-f] [-b speed] "
+                    "[-k secs] [-d] "
                     "[capture-device] [rate]\n",
                     argv[0]);
             return 1;
@@ -481,6 +487,9 @@ int main(int argc, char **argv)
     double vel_x = bounce * cos(40 * M_PI / 180);
     double vel_y = bounce * sin(40 * M_PI / 180);
     int have_pos = 0;
+
+    int hidden = 0;                     /* invisible because of typing */
+    double last_key = 0;
     Atom wm_delete = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
     XSetWMProtocols(dpy, win, &wm_delete, 1);
     XMapWindow(dpy, win);
@@ -586,7 +595,8 @@ int main(int argc, char **argv)
                 h = ev.xconfigure.height;
                 XFreePixmap(dpy, pix);
                 pix = XCreatePixmap(dpy, win, w, h, depth);
-                set_round_shape(dpy, win, w, h);
+                if (!hidden)
+                    set_round_shape(dpy, win, w, h);
             } else if (ev.type == VisibilityNotify) {
                 obscured = ev.xvisibility.state != VisibilityUnobscured;
             } else if (ev.type == ButtonPress && ev.xbutton.button == Button1) {
@@ -608,7 +618,31 @@ int main(int argc, char **argv)
             }
         }
 
-        if (on_top && obscured) {
+        if (hide_secs > 0) {
+            /*
+             * Is any key held down, in any window?  Checked for every
+             * picture; while someone is typing, make the window vanish by
+             * giving it an empty shape, and bring the disc back once the
+             * keyboard has been quiet for hide_secs.
+             */
+            char keys[32];
+            int any = 0, want;
+
+            XQueryKeymap(dpy, keys);
+            for (i = 0; i < 32; i++)
+                any |= keys[i];
+            if (any)
+                last_key = tnow;
+            want = last_key && tnow - last_key < hide_secs;
+            if (want && !hidden)
+                XShapeCombineRectangles(dpy, win, ShapeBounding, 0, 0,
+                                        NULL, 0, ShapeSet, Unsorted);
+            else if (!want && hidden)
+                set_round_shape(dpy, win, w, h);
+            hidden = want;
+        }
+
+        if (on_top && obscured && !hidden) {
             /* At most twice a second, so two such windows cannot fight hard. */
             double t = tnow;
             if (t - last_raise > 0.5) {
@@ -620,8 +654,10 @@ int main(int argc, char **argv)
         analyse(0);
         analyse(1);
         dbg_draws++;
-        draw(dpy, pix, gc, fg, bg, w, h);
-        XCopyArea(dpy, pix, win, gc, 0, 0, w, h, 0, 0);
+        if (!hidden) {
+            draw(dpy, pix, gc, fg, bg, w, h);
+            XCopyArea(dpy, pix, win, gc, 0, 0, w, h, 0, 0);
+        }
         XSync(dpy, False);      /* wait for the server, so frames never queue up */
     }
 
